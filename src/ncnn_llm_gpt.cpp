@@ -1,58 +1,5 @@
 #include "ncnn_llm_gpt.h"
-
-// Static RNG
-static std::mt19937 rng(std::random_device{}());
-
-// Helper functions for sampling
-static void softmax_vec(std::vector<float>& logits, float temperature) {
-    float max_logit = *std::max_element(logits.begin(), logits.end());
-    float sum = 0.f;
-    for (float& x : logits) {
-        x = std::exp((x - max_logit) / temperature);
-        sum += x;
-    }
-    for (float& x : logits) x /= sum;
-}
-
-static void apply_top_k(std::vector<float>& probs, int k) {
-    if (k <= 0 || k >= (int)probs.size()) return;
-    std::vector<float> tmp = probs;
-    std::nth_element(tmp.begin(), tmp.end() - k, tmp.end());
-    float threshold = tmp[tmp.size() - k];
-    for (float& p : probs) if (p < threshold) p = 0.f;
-}
-
-static void apply_top_p(std::vector<float>& probs, float p) {
-    if (p >= 1.0f) return;
-    std::vector<std::pair<float,int>> v;
-    v.reserve(probs.size());
-    for (int i = 0; i < (int)probs.size(); ++i) {
-        v.emplace_back(probs[i], i);
-    }
-    std::sort(v.begin(), v.end(), std::greater<>());
-
-    float cum = 0.f;
-    size_t cutoff = v.size();
-    for (size_t i = 0; i < v.size(); ++i) {
-        cum += v[i].first;
-        if (cum >= p) {
-            cutoff = i + 1;
-            break;
-        }
-    }
-    std::vector<char> keep(probs.size(), 0);
-    for (size_t i = 0; i < cutoff; ++i) {
-        keep[v[i].second] = 1;
-    }
-    for (int i = 0; i < (int)probs.size(); ++i) {
-        if (!keep[i]) probs[i] = 0.f;
-    }
-}
-
-static int sample_from_probs(const std::vector<float>& probs) {
-    std::discrete_distribution<int> dist(probs.begin(), probs.end());
-    return dist(rng);
-}
+#include "sampling.h"
 
 static std::shared_ptr<ncnn_llm_gpt_ctx> clone_ctx(const std::shared_ptr<ncnn_llm_gpt_ctx>& src) {
     auto dst = std::make_shared<ncnn_llm_gpt_ctx>();
@@ -60,15 +7,15 @@ static std::shared_ptr<ncnn_llm_gpt_ctx> clone_ctx(const std::shared_ptr<ncnn_ll
     dst->position_id = src->position_id;
     dst->kv_cache.resize(src->kv_cache.size());
     for (size_t i = 0; i < src->kv_cache.size(); ++i) {
-        dst->kv_cache[i].first = src->kv_cache[i].first;
-        dst->kv_cache[i].second = src->kv_cache[i].second;
+        dst->kv_cache[i].first = src->kv_cache[i].first.clone();
+        dst->kv_cache[i].second = src->kv_cache[i].second.clone();
     }
     return dst;
 }
 
 // Class Implementation
 
-ncnn_llm_gpt::ncnn_llm_gpt(const std::string& model_path, bool use_vulkan) {
+ncnn_llm_gpt::ncnn_llm_gpt(const std::string& model_path, bool use_vulkan, int num_threads, int vulkan_device) {
     try {
         json config;
         {
@@ -81,11 +28,31 @@ ncnn_llm_gpt::ncnn_llm_gpt(const std::string& model_path, bool use_vulkan) {
         embed_net = std::make_shared<ncnn::Net>();
         proj_out_net = std::make_shared<ncnn::Net>();
 
-        if (use_vulkan) {
-            decoder_net->opt.use_vulkan_compute = true;
-            embed_net->opt.use_vulkan_compute = true;
-            proj_out_net->opt.use_vulkan_compute = true;
+        // Set number of threads (0 = use ncnn default which is get_cpu_count())
+        if (num_threads > 0) {
+            decoder_net->opt.num_threads = num_threads;
+            embed_net->opt.num_threads = num_threads;
+            proj_out_net->opt.num_threads = num_threads;
         }
+
+        if (use_vulkan) {
+            printf("[ncnn_llm_gpt] Vulkan enabled, using device %d\n", vulkan_device >= 0 ? vulkan_device : 0);
+            // Only decoder_net uses Vulkan for compute-intensive operations
+
+            // Set specific Vulkan device BEFORE enabling vulkan compute
+            if (vulkan_device >= 0) {
+                decoder_net->opt.vulkan_device_index = vulkan_device;
+            }
+            decoder_net->opt.use_bf16_storage = true;
+            // decoder_net->opt.use_bf16_packed = true;
+            decoder_net->opt.use_fp16_arithmetic = false;
+            decoder_net->opt.use_fp16_storage = false;
+            decoder_net->opt.use_fp16_packed = false;
+            decoder_net->opt.use_vulkan_compute = true;
+        } else {
+            printf("[ncnn_llm_gpt] Vulkan disabled, using CPU only\n");
+        }
+
 
         std::string decoder_param = model_path + "/" + config["params"]["decoder_param"].get<std::string>();
         std::string decoder_bin = model_path + "/" + config["params"]["decoder_bin"].get<std::string>();
@@ -93,6 +60,14 @@ ncnn_llm_gpt::ncnn_llm_gpt(const std::string& model_path, bool use_vulkan) {
         std::string embed_bin = model_path + "/" + config["params"]["embed_token_bin"].get<std::string>();
         std::string proj_out_param = model_path + "/" + config["params"]["proj_out_param"].get<std::string>();
         std::string proj_out_bin = model_path + "/" + config["params"]["proj_out_bin"].get<std::string>();
+
+        printf("Loading model from %s\n", model_path.c_str());
+        printf("  decoder param: %s\n", decoder_param.c_str());
+        printf("  decoder bin: %s\n", decoder_bin.c_str());
+        printf("  embed param: %s\n", embed_param.c_str());
+        printf("  embed bin: %s\n", embed_bin.c_str());
+        printf("  proj_out param: %s\n", proj_out_param.c_str());
+        printf("  proj_out bin: %s\n", proj_out_bin.c_str());
 
         decoder_net->load_param(decoder_param.c_str());
         decoder_net->load_model(decoder_bin.c_str());
@@ -146,8 +121,6 @@ ncnn_llm_gpt::ncnn_llm_gpt(const std::string& model_path, bool use_vulkan) {
                 rope_type = RoPE_Type::NTK_RoPE;
             } else if (rope_cfg["type"] == "YaRNRoPE") {
                 rope_type = RoPE_Type::YARN_RoPE;
-            } else if (rope_cfg["type"] == "HYRoPE") {
-                rope_type = RoPE_Type::HY_RoPE;
             }
 
             if (rope_cfg.contains("rope_scaling"))
@@ -168,11 +141,25 @@ ncnn_llm_gpt::ncnn_llm_gpt(const std::string& model_path, bool use_vulkan) {
             if (func_cfg["type"].get<std::string>() == "tool_call") {
                 if (func_cfg.contains("tool_call_id")) {
                     tool_call_id = bpe->token_to_id().at(func_cfg["tool_call_id"].get<std::string>());
+                    fprintf(stderr, "  tool_call_id: %d\n", tool_call_id);
                 }
                 if (func_cfg.contains("tool_call_end_id")) {
                     tool_call_end_id = bpe->token_to_id().at(func_cfg["tool_call_end_id"].get<std::string>());
+                    fprintf(stderr, "  tool_call_end_id: %d\n", tool_call_end_id);
                 }
             }
+        }
+
+        // Load think tokens if present in tokenizer
+        auto it_think = bpe->token_to_id().find("<think>");
+        if (it_think != bpe->token_to_id().end()) {
+            think_id = it_think->second;
+            fprintf(stderr, "  think_id: %d\n", think_id);
+        }
+        auto it_think_end = bpe->token_to_id().find("</think>");
+        if (it_think_end != bpe->token_to_id().end()) {
+            think_end_id = it_think_end->second;
+            fprintf(stderr, "  think_end_id: %d\n", think_end_id);
         }
 
         // Vision settings
@@ -186,6 +173,11 @@ ncnn_llm_gpt::ncnn_llm_gpt(const std::string& model_path, bool use_vulkan) {
                 std::string vision_embed_patch_bin = model_path + "/" + vision_cfg["vision_embed_patch_bin"].get<std::string>();
                 std::string vision_encoder_param = model_path + "/" + vision_cfg["vision_encoder_param"].get<std::string>();
                 std::string vision_encoder_bin = model_path + "/" + vision_cfg["vision_encoder_bin"].get<std::string>();
+
+                fprintf(stderr, "  vision embed patch param: %s\n", vision_embed_patch_param.c_str());
+                fprintf(stderr, "  vision embed patch bin: %s\n", vision_embed_patch_bin.c_str());
+                fprintf(stderr, "  vision encoder param: %s\n", vision_encoder_param.c_str());
+                fprintf(stderr, "  vision encoder bin: %s\n", vision_encoder_bin.c_str());
 
                 vision_embed_patch = std::make_shared<ncnn::Net>();
                 vision_encoder = std::make_shared<ncnn::Net>();
@@ -236,9 +228,7 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
         generate_ntk_rope_embed_cache(token_ids.size(), rope_head_dim, 0, cos_cache, sin_cache, rope_theta, ntk_scaling_params);
     } else if (rope_type == RoPE_Type::YARN_RoPE) {
         generate_yarn_rope_embed_cache(token_ids.size(), rope_head_dim, 0, cos_cache, sin_cache, rope_theta, ntk_scaling_params);
-    } else if (rope_type == RoPE_Type::HY_RoPE) {
-        generate_hunyuan_rope_embed_cache(token_ids.size(), rope_head_dim, 0, cos_cache, sin_cache, rope_theta, ntk_scaling_params);
-    } 
+    }
     else
     {
         generate_rope_embed_cache(token_ids.size(), rope_head_dim, 0, cos_cache, sin_cache, rope_theta);
@@ -297,8 +287,6 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
         generate_ntk_rope_embed_cache(1, rope_head_dim, (int)token_ids.size(), last_cos_cache, last_sin_cache, rope_theta, ntk_scaling_params);
     } else if (rope_type == RoPE_Type::YARN_RoPE) {
         generate_yarn_rope_embed_cache(1, rope_head_dim, (int)token_ids.size(), last_cos_cache, last_sin_cache, rope_theta, ntk_scaling_params);
-    } else if (rope_type == RoPE_Type::HY_RoPE) {
-        generate_hunyuan_rope_embed_cache(1, rope_head_dim, (int)token_ids.size(), last_cos_cache, last_sin_cache, rope_theta, ntk_scaling_params);
     }
     else {
         generate_rope_embed_cache(1, rope_head_dim, (int)token_ids.size(), last_cos_cache, last_sin_cache, rope_theta);
@@ -361,6 +349,7 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
     return ctx;
 }
 
+#if NCNN_LLM_WITH_OPENCV
 std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input_text, const cv::Mat& bgr, const std::shared_ptr<ncnn_llm_gpt_ctx> ctx) const {
     std::shared_ptr<ncnn_llm_gpt_ctx> new_ctx = clone_ctx(ctx);
 
@@ -494,6 +483,12 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
     new_ctx->cur_token = next_token_id;
     return new_ctx;
 }
+#else
+std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input_text, const cv::Mat& bgr, const std::shared_ptr<ncnn_llm_gpt_ctx> ctx) const {
+    (void)bgr;
+    return prefill(input_text, ctx);
+}
+#endif
 
 std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input_text, const std::shared_ptr<ncnn_llm_gpt_ctx> ctx) const {
     std::shared_ptr<ncnn_llm_gpt_ctx> new_ctx = clone_ctx(ctx);
@@ -511,8 +506,6 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
         generate_ntk_rope_embed_cache(token_ids.size(), rope_head_dim, current_pos, cos_cache, sin_cache, rope_theta, ntk_scaling_params);
     } else if (rope_type == RoPE_Type::YARN_RoPE) {
         generate_yarn_rope_embed_cache(token_ids.size(), rope_head_dim, current_pos, cos_cache, sin_cache, rope_theta, ntk_scaling_params);
-    } else if (rope_type == RoPE_Type::HY_RoPE) {
-        generate_hunyuan_rope_embed_cache(token_ids.size(), rope_head_dim, current_pos, cos_cache, sin_cache, rope_theta, ntk_scaling_params);
     }
     else {
         generate_rope_embed_cache(token_ids.size(), rope_head_dim, current_pos, cos_cache, sin_cache, rope_theta);
@@ -579,8 +572,6 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
         generate_ntk_rope_embed_cache(1, rope_head_dim, last_token_pos, last_cos_cache, last_sin_cache, rope_theta, ntk_scaling_params);
     } else if (rope_type == RoPE_Type::YARN_RoPE) {
         generate_yarn_rope_embed_cache(1, rope_head_dim, last_token_pos, last_cos_cache, last_sin_cache, rope_theta, ntk_scaling_params);
-    } else if (rope_type == RoPE_Type::HY_RoPE) {
-        generate_hunyuan_rope_embed_cache(1, rope_head_dim, last_token_pos, last_cos_cache, last_sin_cache, rope_theta, ntk_scaling_params);
     }
     else {
         generate_rope_embed_cache(1, rope_head_dim, last_token_pos, last_cos_cache, last_sin_cache, rope_theta);
@@ -705,8 +696,6 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::generate(const std::shared_ptr<n
                 generate_ntk_rope_embed_cache(1, rope_head_dim, ctx->position_id, cos_cache, sin_cache, rope_theta, ntk_scaling_params);
             } else if (rope_type == RoPE_Type::YARN_RoPE) {
                 generate_yarn_rope_embed_cache(1, rope_head_dim, ctx->position_id, cos_cache, sin_cache, rope_theta, ntk_scaling_params);
-            } else if (rope_type == RoPE_Type::HY_RoPE) {
-                generate_hunyuan_rope_embed_cache(1, rope_head_dim, ctx->position_id, cos_cache, sin_cache, rope_theta, ntk_scaling_params);
             }
             else {
                 generate_rope_embed_cache(1, rope_head_dim, ctx->position_id, cos_cache, sin_cache, rope_theta);
@@ -740,7 +729,7 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::generate(const std::shared_ptr<n
                     ncnn::Mat k_cache, v_cache;
                     ex.extract(kname, k_cache);
                     ex.extract(vname, v_cache);
-                    ctx->kv_cache[i] = { k_cache, v_cache };
+                    ctx->kv_cache[i] = { std::move(k_cache), std::move(v_cache) };
                 }
                 ex.extract("out0", decode_out);
             }
@@ -785,19 +774,18 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::generate(const std::shared_ptr<n
     Beam b0;
     b0.ctx = base_ctx;
     b0.tokens.insert(base_ctx->cur_token);
-    b0.prev_token = -1; 
+    b0.token_history.push_back(base_ctx->cur_token);
+    b0.token_in_tool_call.push_back(false);
+    b0.prev_token = -1;
     beams.push_back(std::move(b0));
 
     if (beams[0].ctx->cur_token == tool_call_id) {
         beams[0].in_tool_call = true;
+        beams[0].token_in_tool_call[0] = true;
     }
 
-    auto maybe_emit_prev = [&](const Beam& best){
-        int t = best.prev_token;
-        if (t != -1 && !best.prev_in_tool_call && t != eos && t != tool_call_id && t != tool_call_end_id) {
-            callback(bpe->decode({t}, false));
-        }
-    };
+    // Track how many tokens have been emitted for real-time output
+    size_t emitted_count = 0;
 
     for (int step = 0; step < cfg.max_new_tokens; ++step) {
         std::vector<Beam> candidates;
@@ -829,8 +817,6 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::generate(const std::shared_ptr<n
                 generate_ntk_rope_embed_cache(1, rope_head_dim, bctx.position_id, cos_cache, sin_cache, rope_theta, ntk_scaling_params);
             } else if (rope_type == RoPE_Type::YARN_RoPE) {
                 generate_yarn_rope_embed_cache(1, rope_head_dim, bctx.position_id, cos_cache, sin_cache, rope_theta, ntk_scaling_params);
-            } else if (rope_type == RoPE_Type::HY_RoPE) {
-                generate_hunyuan_rope_embed_cache(1, rope_head_dim, bctx.position_id, cos_cache, sin_cache, rope_theta, ntk_scaling_params);
             }
             else {
                 generate_rope_embed_cache(1, rope_head_dim, bctx.position_id, cos_cache, sin_cache, rope_theta);
@@ -862,7 +848,7 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::generate(const std::shared_ptr<n
                     ncnn::Mat k_cache, v_cache;
                     ex.extract(kname, k_cache);
                     ex.extract(vname, v_cache);
-                    bctx.kv_cache[i] = { k_cache, v_cache };
+                    bctx.kv_cache[i] = { std::move(k_cache), std::move(v_cache) };
                 }
                 ex.extract("out0", decode_out);
             }
@@ -907,6 +893,10 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::generate(const std::shared_ptr<n
 
                 nb.tokens = beam.tokens;
                 nb.tokens.insert(tok);
+                nb.token_history = beam.token_history;
+                nb.token_history.push_back(tok);
+                nb.token_in_tool_call = beam.token_in_tool_call;
+                nb.token_in_tool_call.push_back(beam.in_tool_call);
                 nb.score  = beam.score + std::log(p + 1e-9f);
                 nb.finished = (tok == eos);
                 nb.in_tool_call = beam.in_tool_call;
@@ -978,7 +968,28 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::generate(const std::shared_ptr<n
 
         beams = std::move(next_beams);
         auto& best = beams[0];
-        maybe_emit_prev(best);
+
+        // Real-time output: emit tokens that are confirmed across all beams
+        // Find the minimum token_history length across all beams
+        size_t min_history = best.token_history.size();
+        for (const auto& b : beams) {
+            min_history = std::min(min_history, b.token_history.size());
+        }
+
+        // Emit new tokens from the best beam up to min_history
+        // These tokens are "confirmed" because all beams have them
+        while (emitted_count < min_history) {
+            int tok = best.token_history[emitted_count];
+            bool in_tool = best.token_in_tool_call[emitted_count];
+            // Output all tokens except:
+            // - eos
+            // - tool_call_id, tool_call_end_id (and content in between)
+            // - think_id, think_end_id are NOT filtered (they should be output)
+            if (tok != eos && tok != tool_call_id && tok != tool_call_end_id && !in_tool) {
+                callback(bpe->decode({tok}, false));
+            }
+            emitted_count++;
+        }
 
         if (best.ctx->cur_token == eos || best.finished) break;
         
@@ -990,6 +1001,16 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::generate(const std::shared_ptr<n
     }
 
     auto best_it = std::max_element(beams.begin(), beams.end(), [](const Beam& a, const Beam& b) { return a.score < b.score; });
+
+    // Output any remaining tokens that haven't been emitted yet
+    for (size_t i = emitted_count; i < best_it->token_history.size(); ++i) {
+        int tok = best_it->token_history[i];
+        bool in_tool = best_it->token_in_tool_call[i];
+        if (tok != eos && tok != tool_call_id && tok != tool_call_end_id && !in_tool) {
+            callback(bpe->decode({tok}, false));
+        }
+    }
+
     return best_it->ctx;
 }
 
@@ -1026,6 +1047,7 @@ void ncnn_llm_gpt::get_image_size_for_patches(int image_height, int image_width,
     }
 }
 
+#if NCNN_LLM_WITH_OPENCV
 ncnn::Mat ncnn_llm_gpt::bgr_to_pixel_values(const cv::Mat& bgr) const {
     const float image_mean[3] = {0.48145466f, 0.4578275f, 0.40821073f};
     const float image_std[3] = {0.26862954f, 0.26130258f, 0.27577711f};
@@ -1076,6 +1098,12 @@ ncnn::Mat ncnn_llm_gpt::bgr_to_pixel_values(const cv::Mat& bgr) const {
     }
     return pixel_values;
 }
+#else
+ncnn::Mat ncnn_llm_gpt::bgr_to_pixel_values(const cv::Mat& bgr) const {
+    (void)bgr;
+    return ncnn::Mat();
+}
+#endif
 
 ncnn::Mat ncnn_llm_gpt::reorder_patches_for_merge(const ncnn::Mat& pixel_values, int h_patches, int w_patches) const {
     int num_patches = pixel_values.h;
@@ -1211,6 +1239,7 @@ void ncnn_llm_gpt::generate_rope_embeds(int num_patches_w, int num_patches_h, nc
     }
 }
 
+#if NCNN_LLM_WITH_OPENCV
 int ncnn_llm_gpt::get_visiual_features(const cv::Mat& bgr, ncnn::Mat& image_embeds, int& num_patches_w, int& num_patches_h) const {
     if (bgr.empty()) {
         image_embeds.release();
@@ -1325,3 +1354,12 @@ int ncnn_llm_gpt::get_visiual_features(const cv::Mat& bgr, ncnn::Mat& image_embe
     image_embeds = image_embeds_restored;
     return 0;
 }
+#else
+int ncnn_llm_gpt::get_visiual_features(const cv::Mat& bgr, ncnn::Mat& image_embeds, int& num_patches_w, int& num_patches_h) const {
+    (void)bgr;
+    image_embeds.release();
+    num_patches_w = 0;
+    num_patches_h = 0;
+    return -1;
+}
+#endif

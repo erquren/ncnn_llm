@@ -16,11 +16,19 @@
 #include <unordered_set>
 #include <algorithm>
 
+#ifndef NCNN_LLM_WITH_OPENCV
+#define NCNN_LLM_WITH_OPENCV 1
+#endif
+
+#if NCNN_LLM_WITH_OPENCV
 #include <opencv2/core/core.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
+#else
+namespace cv { class Mat; }
+#endif
 
-#include <ncnn/mat.h>
-#include <ncnn/net.h>
+#include <mat.h>
+#include <net.h>
 #include <nlohmann/json.hpp>
 
 #include "utils/tokenizer/bpe_tokenizer.h"
@@ -57,6 +65,8 @@ struct Beam {
     bool in_tool_call = false;
     std::string tool_buffer;
     std::unordered_set<int> tokens;
+    std::vector<int> token_history;  // Complete token sequence for this beam
+    std::vector<bool> token_in_tool_call;  // Whether each token was generated inside a tool call
     
     int prev_token = -1;
     bool prev_in_tool_call = false;
@@ -77,6 +87,8 @@ protected:
     int eos = 0;
     int tool_call_id = -1;
     int tool_call_end_id = -1;
+    int think_id = -1;
+    int think_end_id = -1;
     int attn_cnt = 32;
     int rope_head_dim = 64;
 
@@ -84,8 +96,7 @@ protected:
         RoPE = 0,
         LongRoPE = 1,
         NTK_RoPE = 2,
-        YARN_RoPE = 3,
-        HY_RoPE = 4
+        YARN_RoPE = 3
     } rope_type;
     float rope_theta = 100000.0f;
 
@@ -109,7 +120,7 @@ protected:
     std::vector<nlohmann::json> tools;
 
 public:
-    ncnn_llm_gpt(const std::string& model_path, bool use_vulkan = false);
+    ncnn_llm_gpt(const std::string& model_path, bool use_vulkan = false, int num_threads = 0, int vulkan_device = 0);
 
     std::shared_ptr<ncnn_llm_gpt_ctx> prefill(const std::string& input_text) const;
     std::shared_ptr<ncnn_llm_gpt_ctx> prefill(const std::string& input_text, const cv::Mat& bgr, const std::shared_ptr<ncnn_llm_gpt_ctx> ctx) const;
